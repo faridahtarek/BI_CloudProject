@@ -5,19 +5,27 @@ import { fileURLToPath } from "url";
 import cors from "cors";
 import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
-import fs from "fs";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Ensure uploads directory exists
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir);
-}
+// --- AWS Clients (use EC2 Instance Role, no keys needed) ---
+const s3 = new S3Client({ region: process.env.AWS_REGION });
 
-// Memory-based database (Placeholder for RDS/DynamoDB)
-// In a real AWS scenario, this would be a DynamoDB table or RDS database.
+const dynamo = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: process.env.AWS_REGION })
+);
+
+const BUCKET = process.env.S3_BUCKET_NAME!;
+const TABLE = process.env.DYNAMODB_TABLE!;
+
+// --- Profile type ---
 interface Profile {
   id: string;
   name: string;
@@ -27,42 +35,29 @@ interface Profile {
   createdAt: string;
 }
 
-let profiles: Profile[] = [];
+// --- Multer: memory storage (no local disk) ---
+const upload = multer({ storage: multer.memoryStorage() });
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || "3000");
 
   app.use(cors());
   app.use(express.json());
 
-  // Static folder for uploads
-  // AWS S3 Tip: In production, you would serve these from an S3 bucket URL.
-  app.use("/uploads", express.static(uploadDir));
-
-  // --- API Routes ---
-
-  // GET all profiles
-  app.get("/api/profiles", (req, res) => {
-    res.json(profiles);
+  // GET all profiles — reads from DynamoDB
+  app.get("/api/profiles", async (req, res) => {
+    try {
+      const result = await dynamo.send(new ScanCommand({ TableName: TABLE }));
+      res.json(result.Items || []);
+    } catch (error) {
+      console.error("Error fetching profiles:", error);
+      res.status(500).json({ error: "Failed to fetch profiles" });
+    }
   });
 
-  // POST create profile
-  // AWS Tip: This is where you would use IAM roles to grant permission
-  // for your EC2 instance to write to DynamoDB and upload to S3.
-  const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-      cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname);
-      cb(null, `${uuidv4()}${ext}`);
-    },
-  });
-
-  const upload = multer({ storage });
-
-  app.post("/api/profiles", upload.single("image"), (req, res) => {
+  // POST create profile — uploads image to S3, saves metadata to DynamoDB
+  app.post("/api/profiles", upload.single("image"), async (req, res) => {
     try {
       const { name, age, position } = req.body;
       const file = req.file;
@@ -71,16 +66,33 @@ async function startServer() {
         return res.status(400).json({ error: "Image is required" });
       }
 
+      // 1. Upload image to S3
+      const fileKey = `${uuidv4()}${path.extname(file.originalname)}`;
+      await s3.send(new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: fileKey,
+        Body: file.buffer,
+        ContentType: file.mimetype,
+      }));
+
+      // 2. Build the public S3 URL
+      const imageUrl = `https://${BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileKey}`;
+
+      // 3. Save profile metadata to DynamoDB
       const newProfile: Profile = {
         id: uuidv4(),
         name,
         age: parseInt(age),
         position,
-        imageUrl: `/uploads/${file.filename}`, // Using relative URL for now
+        imageUrl,
         createdAt: new Date().toISOString(),
       };
 
-      profiles.push(newProfile);
+      await dynamo.send(new PutCommand({
+        TableName: TABLE,
+        Item: newProfile,
+      }));
+
       res.status(201).json(newProfile);
     } catch (error) {
       console.error("Error creating profile:", error);
@@ -105,7 +117,6 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    console.log(`Development mode: ${process.env.NODE_ENV !== "production"}`);
   });
 }
 
