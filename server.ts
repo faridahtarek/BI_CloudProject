@@ -8,6 +8,7 @@ import { v4 as uuidv4 } from "uuid";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { CloudWatchLogsClient, PutLogEventsCommand, CreateLogStreamCommand } from "@aws-sdk/client-cloudwatch-logs";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -22,8 +23,32 @@ const dynamo = DynamoDBDocumentClient.from(
   new DynamoDBClient({ region: process.env.AWS_REGION })
 );
 
+const cloudwatch = new CloudWatchLogsClient({ region: process.env.AWS_REGION });
+const LOG_GROUP = "/cloud-project/server";
+const LOG_STREAM = `stream-${Date.now()}`;
+
 const BUCKET = process.env.S3_BUCKET_NAME!;
 const TABLE = process.env.DYNAMODB_TABLE!;
+
+// --- CloudWatch helpers ---
+async function initLogStream() {
+  try {
+    await cloudwatch.send(new CreateLogStreamCommand({
+      logGroupName: LOG_GROUP,
+      logStreamName: LOG_STREAM,
+    }));
+  } catch (e) { }
+}
+
+async function logToCloudWatch(message: string) {
+  try {
+    await cloudwatch.send(new PutLogEventsCommand({
+      logGroupName: LOG_GROUP,
+      logStreamName: LOG_STREAM,
+      logEvents: [{ timestamp: Date.now(), message }],
+    }));
+  } catch (e) { }
+}
 
 // --- Profile type ---
 interface Profile {
@@ -41,6 +66,8 @@ const upload = multer({ storage: multer.memoryStorage() });
 async function startServer() {
   const app = express();
   const PORT = parseInt(process.env.PORT || "3000");
+
+  await initLogStream();
 
   app.use(cors());
   app.use(express.json());
@@ -92,6 +119,9 @@ async function startServer() {
         TableName: TABLE,
         Item: newProfile,
       }));
+
+      // 4. Log to CloudWatch
+      await logToCloudWatch(`New profile created: ${newProfile.name}, ${newProfile.position}`);
 
       res.status(201).json(newProfile);
     } catch (error) {
